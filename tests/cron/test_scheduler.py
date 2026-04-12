@@ -765,6 +765,62 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
         fake_db.close.assert_called_once()
 
+    def test_run_job_preserves_origin_thread_id_for_topic_delivery(self, tmp_path, monkeypatch):
+        job = {
+            "id": "topic-job",
+            "name": "topic test",
+            "prompt": "hello",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "-1001234567890",
+                "chat_name": "Test Topic Group",
+                "thread_id": "14",
+            },
+            "deliver": "origin",
+        }
+        fake_db = MagicMock()
+        seen = {}
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                seen["session_thread_id"] = os.getenv("HERMES_SESSION_THREAD_ID")
+                seen["deliver_platform"] = os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM")
+                seen["deliver_chat_id"] = os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID")
+                seen["deliver_thread_id"] = os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID")
+                return {"final_response": "ok"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("dotenv.load_dotenv"), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent):
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert "ok" in output
+        assert seen == {
+            "session_thread_id": "14",
+            "deliver_platform": "telegram",
+            "deliver_chat_id": "-1001234567890",
+            "deliver_thread_id": "14",
+        }
+        assert os.getenv("HERMES_SESSION_THREAD_ID") is None
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
+        fake_db.close.assert_called_once()
+
 
 class TestRunJobConfigLogging:
     """Verify that config.yaml parse failures are logged, not silently swallowed."""

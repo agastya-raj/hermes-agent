@@ -607,6 +607,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             os.environ["HERMES_SESSION_CHAT_ID"] = str(origin["chat_id"])
             if origin.get("chat_name"):
                 os.environ["HERMES_SESSION_CHAT_NAME"] = origin["chat_name"]
+            if origin.get("thread_id") is not None:
+                os.environ["HERMES_SESSION_THREAD_ID"] = str(origin["thread_id"])
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart.
         from dotenv import load_dotenv
@@ -878,6 +880,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             "HERMES_SESSION_PLATFORM",
             "HERMES_SESSION_CHAT_ID",
             "HERMES_SESSION_CHAT_NAME",
+            "HERMES_SESSION_THREAD_ID",
             "HERMES_CRON_AUTO_DELIVER_PLATFORM",
             "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
             "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
