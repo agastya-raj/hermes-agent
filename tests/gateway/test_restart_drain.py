@@ -13,7 +13,9 @@ from tests.gateway.restart_test_helpers import make_restart_runner, make_restart
 
 
 @pytest.mark.asyncio
-async def test_restart_command_while_busy_requests_drain_without_interrupt():
+async def test_restart_command_while_busy_requests_drain_without_interrupt(monkeypatch):
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.delenv("SYSTEMD_EXEC_PID", raising=False)
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
     event = MessageEvent(
@@ -26,11 +28,38 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt():
     running_agent = MagicMock()
     runner._running_agents[session_key] = running_agent
 
-    result = await runner._handle_message(event)
+    result = await runner._handle_restart_command(event)
 
     assert result == "⏳ Draining 1 active agent(s) before restart..."
     running_agent.interrupt.assert_not_called()
     runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+
+
+@pytest.mark.asyncio
+async def test_restart_command_uses_systemd_when_managed(monkeypatch):
+    runner, _adapter = make_restart_runner()
+    monkeypatch.setenv("INVOCATION_ID", "abc123")
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m1",
+    )
+
+    refresh = MagicMock(return_value=True)
+    request_self_restart = MagicMock(return_value=True)
+    monkeypatch.setattr(gateway_run, "refresh_systemd_unit_if_needed", refresh, raising=False)
+    monkeypatch.setattr(gateway_run, "_request_gateway_self_restart", request_self_restart, raising=False)
+    monkeypatch.setattr("hermes_cli.gateway.refresh_systemd_unit_if_needed", refresh)
+    monkeypatch.setattr("hermes_cli.gateway._request_gateway_self_restart", request_self_restart)
+    runner.request_restart = MagicMock(return_value=True)
+
+    result = await runner._handle_restart_command(event)
+
+    assert result == "♻ Restarting gateway via systemd..."
+    refresh.assert_called_once_with(system=False)
+    request_self_restart.assert_called_once()
+    runner.request_restart.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -59,7 +88,7 @@ async def test_drain_queue_mode_queues_follow_up_without_interrupt():
 
 @pytest.mark.asyncio
 async def test_draining_rejects_new_session_messages():
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner._draining = True
     runner._restart_requested = True
 
@@ -70,9 +99,19 @@ async def test_draining_rejects_new_session_messages():
         message_id="m3",
     )
 
-    result = await runner._handle_message(event)
+    sent = []
 
-    assert result == "⏳ Gateway is restarting and is not accepting new work right now."
+    async def fake_send_with_retry(**kwargs):
+        sent.append(kwargs)
+        return None
+
+    adapter._send_with_retry = fake_send_with_retry
+
+    handled = await runner._handle_active_session_busy_message(event, build_session_key(event.source))
+
+    assert handled is True
+    assert sent
+    assert sent[0]["content"] == "⏳ Gateway is restarting and is not accepting another turn right now."
 
 
 def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, monkeypatch):

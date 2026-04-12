@@ -804,6 +804,9 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
 
     common_bin_paths = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
     restart_timeout = max(60, int(_get_restart_drain_timeout() or 0))
+    # Give the gateway a small buffer beyond its own drain budget so systemd
+    # doesn't SIGKILL it exactly when the graceful shutdown path is finishing.
+    stop_timeout = restart_timeout + 15
 
     if system:
         username, group_name, home_dir = _system_service_identity(run_as_user)
@@ -846,7 +849,7 @@ RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 KillMode=mixed
 KillSignal=SIGTERM
 ExecReload=/bin/kill -USR1 $MAINPID
-TimeoutStopSec={restart_timeout}
+TimeoutStopSec={stop_timeout}
 StandardOutput=journal
 StandardError=journal
 
@@ -878,7 +881,7 @@ RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 KillMode=mixed
 KillSignal=SIGTERM
 ExecReload=/bin/kill -USR1 $MAINPID
-TimeoutStopSec={restart_timeout}
+TimeoutStopSec={stop_timeout}
 StandardOutput=journal
 StandardError=journal
 

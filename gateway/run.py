@@ -1445,6 +1445,10 @@ class GatewayRunner:
                 start_new_session=True,
             )
 
+    def _is_managed_by_systemd(self) -> bool:
+        """Best-effort detection for whether the gateway is running under systemd."""
+        return bool(os.getenv("INVOCATION_ID") or os.getenv("SYSTEMD_EXEC_PID"))
+
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
         if self._restart_task_started:
             return False
@@ -4143,10 +4147,26 @@ class GatewayRunner:
             return "⏳ Gateway restart already in progress..."
 
         active_agents = self._running_agent_count()
-        self.request_restart(detached=True, via_service=False)
+        managed_by_systemd = self._is_managed_by_systemd()
+
+        if managed_by_systemd:
+            try:
+                from hermes_cli.gateway import refresh_systemd_unit_if_needed, _request_gateway_self_restart
+
+                refresh_systemd_unit_if_needed(system=False)
+                if _request_gateway_self_restart(os.getpid()):
+                    if active_agents:
+                        return f"⏳ Draining {active_agents} active agent(s) before systemd restart..."
+                    return "♻ Restarting gateway via systemd..."
+            except Exception as e:
+                logger.warning("Telegram /restart fell back from self-restart path: %s", e)
+
+        self.request_restart(detached=not managed_by_systemd, via_service=managed_by_systemd)
         if active_agents:
+            if managed_by_systemd:
+                return f"⏳ Draining {active_agents} active agent(s) before systemd restart..."
             return f"⏳ Draining {active_agents} active agent(s) before restart..."
-        return "♻ Restarting gateway..."
+        return "♻ Restarting gateway via systemd..." if managed_by_systemd else "♻ Restarting gateway..."
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
