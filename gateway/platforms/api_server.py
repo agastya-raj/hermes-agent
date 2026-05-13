@@ -8,6 +8,8 @@ Exposes an HTTP server with endpoints:
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- GET  /v1/commands                — machine-readable gateway slash command registry
+- POST /v1/commands/{name}         — parity-safe slash command dispatch/results
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
@@ -947,6 +949,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_approval_response": True,
+                "slash_command_registry": True,
+                "slash_command_dispatch": "metadata_and_read_only_subset",
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
@@ -957,6 +961,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health": {"method": "GET", "path": "/health"},
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
+                "commands": {"method": "GET", "path": "/v1/commands"},
+                "command_execute": {"method": "POST", "path": "/v1/commands/{name}"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
@@ -966,6 +972,174 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
             },
         })
+
+    async def _handle_commands(self, request: "web.Request") -> "web.Response":
+        """GET /v1/commands — machine-readable gateway slash command registry."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from hermes_cli.commands import gateway_command_records
+            commands = gateway_command_records()
+        except Exception as exc:
+            logger.warning("Failed to build command registry: %s", exc)
+            return web.json_response(_openai_error("Command registry unavailable"), status=503)
+        enabled_count = sum(1 for command in commands if command.get("enabled"))
+        return web.json_response({
+            "object": "hermes.gateway.commands",
+            "surface": "api_server",
+            "commands": commands,
+            "data": commands,
+            "count": len(commands),
+            "enabled_count": enabled_count,
+        })
+
+    async def _handle_command_execute(self, request: "web.Request") -> "web.Response":
+        """POST /v1/commands/{name} — parity-safe slash command dispatch.
+
+        Full gateway command execution mutates live session/gateway state and is
+        progressively exposed. This endpoint is deliberately truthful: it uses
+        the same registry as the gateway, executes read-only/status commands,
+        and returns requires_confirmation for mutating/dangerous commands.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        raw_name = (request.match_info.get("name") or "").strip().lower().lstrip("/")
+        if not raw_name or not re.match(r"^[a-z0-9_-]{1,64}$", raw_name):
+            return web.json_response(_openai_error("Invalid command name"), status=400)
+        try:
+            body = await request.json() if request.can_read_body else {}
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("Command body must be an object"), status=400)
+        try:
+            from hermes_cli.commands import gateway_command_records, gateway_help_lines, resolve_command
+            cmd = resolve_command(raw_name)
+            records = gateway_command_records()
+        except Exception as exc:
+            logger.warning("Failed to resolve command %s: %s", raw_name, exc)
+            return web.json_response(_openai_error("Command registry unavailable"), status=503)
+        record = next(
+            (item for item in records if item.get("name") == (cmd.name if cmd else raw_name)
+             or raw_name in item.get("aliases", [])),
+            None,
+        )
+        if not cmd:
+            if record:
+                if record.get("source") == "skill":
+                    return web.json_response({
+                        "command": raw_name,
+                        "status": "requires_run",
+                        "message": record.get("disabled_reason") or f"/{raw_name} requires a Hermes agent run.",
+                        "risk": record.get("risk"),
+                        "execution_mode": record.get("execution_mode"),
+                        "effects": {},
+                    }, status=409)
+                return web.json_response({
+                    "command": raw_name,
+                    "status": "unsupported",
+                    "message": record.get("disabled_reason") or f"/{raw_name} is not exposed through the API command executor.",
+                    "risk": record.get("risk"),
+                    "execution_mode": record.get("execution_mode"),
+                    "effects": {},
+                }, status=409)
+            return web.json_response({
+                "command": raw_name,
+                "status": "unsupported",
+                "message": f"/{raw_name} is not a supported Hermes gateway command.",
+                "effects": {},
+            }, status=404)
+        if not record:
+            return web.json_response({
+                "command": raw_name,
+                "status": "unsupported",
+                "message": f"/{raw_name} is not a supported Hermes gateway command.",
+                "effects": {},
+            }, status=404)
+        canonical = cmd.name
+        if not record.get("supported"):
+            return web.json_response({
+                "command": canonical,
+                "status": "unsupported",
+                "message": record.get("disabled_reason") or f"/{canonical} is not available in this gateway.",
+                "effects": {},
+            }, status=409)
+        if record.get("risk") != "read_only":
+            return web.json_response({
+                "command": canonical,
+                "status": "requires_confirmation",
+                "message": (
+                    f"/{canonical} is registered in the Hermes gateway, but API execution "
+                    "for mutating or dangerous slash commands is confirmation-gated and not enabled yet."
+                ),
+                "risk": record.get("risk"),
+                "effects": {
+                    "session_reset": False,
+                    "transcript_mutated": False,
+                    "config_written": False,
+                    "agent_cache_evicted": False,
+                },
+            }, status=409)
+        args = str(body.get("args") or body.get("text") or "").strip()
+        if args:
+            return web.json_response({
+                "command": canonical,
+                "status": "rejected",
+                "message": f"/{canonical} is available through the API as a read-only status command without arguments.",
+                "effects": {},
+            }, status=400)
+        message = self._read_only_command_message(canonical, records, gateway_help_lines())
+        return web.json_response({
+            "command": canonical,
+            "status": "succeeded",
+            "message": message,
+            "session_id": None,
+            "effects": {
+                "session_reset": False,
+                "transcript_mutated": False,
+                "config_written": False,
+                "agent_cache_evicted": False,
+            },
+        })
+
+    def _read_only_command_message(self, command: str, records: list[dict[str, Any]], help_lines: list[str]) -> str:
+        if command == "help":
+            return "Available gateway commands:\n" + "\n".join(help_lines[:30])
+        if command == "commands":
+            return f"{len(records)} gateway slash commands are registered; {sum(1 for r in records if r.get('enabled'))} are read-only API-enabled."
+        if command == "status":
+            return f"Hermes API server is running. model={self._model_name}; active_runs={len(self._active_run_tasks)}"
+        if command == "profile":
+            return "API server surface: api_server. Profile details are intentionally not exposed here."
+        if command == "whoami":
+            return "Authenticated API client with bearer access to this Hermes API server."
+        if command == "agents":
+            return f"Active API runs: {len(self._active_run_tasks)}."
+        if command == "model":
+            return f"Current API server model: {self._model_name}."
+        if command == "title":
+            return "API server command surface has no active gateway conversation title."
+        if command == "goal":
+            return "Goal state belongs to gateway/CLI sessions and is not exposed read-only through the API yet."
+        if command == "usage":
+            return "Usage details are not exposed through this API command surface yet."
+        if command == "insights":
+            return "Insights are not exposed through this API command surface yet."
+        if command == "sessions":
+            return "Session browsing is not exposed through this API command surface yet."
+        if command == "resume":
+            return "Resume requires session selection and is not executed through this read-only API surface."
+        if command == "reasoning":
+            return "Reasoning status is provider/session-specific and not exposed through this API command surface yet."
+        if command == "footer":
+            return "Gateway footer status is not exposed through this API command surface yet."
+        if command == "fast":
+            return "Fast-mode status is not exposed through this API command surface yet."
+        if command == "voice":
+            return "Voice status is not exposed through this API command surface yet."
+        return f"/{command} is registered as a read-only command."
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -3346,6 +3520,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/v1/commands", self._handle_commands)
+            self._app.router.add_post("/v1/commands/{name}", self._handle_command_execute)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)

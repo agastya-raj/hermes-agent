@@ -431,6 +431,182 @@ def gateway_help_lines() -> list[str]:
     return lines
 
 
+_READ_ONLY_GATEWAY_COMMANDS: frozenset[str] = frozenset({
+    "help", "commands", "whoami", "status", "profile", "agents",
+    "usage", "insights", "model", "reasoning", "title", "footer",
+    "fast", "voice", "goal",
+})
+
+_SESSION_MUTATION_GATEWAY_COMMANDS: frozenset[str] = frozenset({
+    "title", "model", "personality", "reasoning", "fast", "footer",
+    "voice", "queue", "steer", "goal", "reload-skills", "reload-mcp",
+    "sethome", "branch", "compress", "retry", "background", "kanban",
+    "curator", "resume",
+})
+
+_HIGH_RISK_GATEWAY_COMMANDS: frozenset[str] = frozenset({
+    "new", "undo", "rollback", "stop", "restart", "update", "approve",
+    "deny", "yolo", "debug",
+})
+
+
+def _gateway_command_risk(cmd: CommandDef) -> str:
+    """Return a coarse risk class for Homebase/API command surfaces."""
+    if cmd.name in _HIGH_RISK_GATEWAY_COMMANDS:
+        return "dangerous"
+    if cmd.name in _SESSION_MUTATION_GATEWAY_COMMANDS:
+        return "safe_mutation"
+    if cmd.name in _READ_ONLY_GATEWAY_COMMANDS:
+        return "read_only"
+    if cmd.gateway_only:
+        return "safe_mutation"
+    return "safe_mutation"
+
+
+def _gateway_command_mid_run(cmd: CommandDef) -> str:
+    if cmd.name in ACTIVE_SESSION_BYPASS_COMMANDS:
+        return "allowed"
+    return "busy_if_running"
+
+
+def _gateway_command_input_mode(args_hint: str, subcommands: list[str] | tuple[str, ...] | None = None) -> str:
+    """Classify how a command expects input for API/Homebase UIs."""
+    if subcommands:
+        return "subcommand"
+    hint = (args_hint or "").strip()
+    if not hint:
+        return "none"
+    if hint.startswith("{") or "json" in hint.lower():
+        return "structured"
+    return "text"
+
+
+def _gateway_command_execution_mode(*, api_supported: bool, risk: str, source: str) -> str:
+    """Return a truthful execution class for external command surfaces."""
+    if source == "plugin":
+        return "metadata_only"
+    if source == "skill":
+        return "run"
+    if api_supported and risk == "read_only":
+        return "sync"
+    return "confirmation_required"
+
+
+def gateway_command_records(*, include_plugins: bool = True, include_skills: bool = True) -> list[dict[str, Any]]:
+    """Return structured gateway slash-command metadata.
+
+    This is the machine-readable sibling of :func:`gateway_help_lines` and is
+    intentionally safe for API/Homebase exposure: it returns command names,
+    aliases, descriptions, risk labels, and disabled reasons, but never raw
+    config values, platform allowlists, tokens, or handler internals.
+    """
+    overrides = _resolve_config_gates()
+    records: list[dict[str, Any]] = []
+    for cmd in COMMAND_REGISTRY:
+        gateway_known = (not cmd.cli_only) or bool(cmd.gateway_config_gate)
+        available = _is_gateway_available(cmd, overrides)
+        if not gateway_known and not available:
+            continue
+        disabled_reason = None
+        if not available:
+            disabled_reason = "disabled by gateway configuration"
+        risk = _gateway_command_risk(cmd)
+        api_supported = available and risk == "read_only"
+        if available and not api_supported:
+            disabled_reason = "requires confirmation or agent/session context; API execution is not enabled yet"
+        records.append({
+            "name": cmd.name,
+            "aliases": list(cmd.aliases),
+            "description": cmd.description,
+            "category": cmd.category,
+            "args_hint": cmd.args_hint,
+            "subcommands": list(cmd.subcommands),
+            "risk": risk,
+            "gateway_supported": available,
+            "api_supported": api_supported,
+            "supported": available,
+            "enabled": api_supported,
+            "disabled_reason": disabled_reason if available else disabled_reason or "not available in gateway",
+            "mid_run": _gateway_command_mid_run(cmd),
+            "source": "builtin",
+            "input_mode": _gateway_command_input_mode(cmd.args_hint, cmd.subcommands),
+            "execution_mode": _gateway_command_execution_mode(
+                api_supported=api_supported,
+                risk=risk,
+                source="builtin",
+            ),
+        })
+
+    if include_plugins:
+        for name, description, args_hint in _iter_plugin_command_entries():
+            records.append({
+                "name": name,
+                "aliases": [],
+                "description": description,
+                "category": "Plugin",
+                "args_hint": args_hint,
+                "subcommands": [],
+                "risk": "unknown",
+                "gateway_supported": True,
+                "api_supported": False,
+                "supported": False,
+                "enabled": False,
+                "disabled_reason": "plugin command execution is not exposed through the API yet",
+                "mid_run": "busy_if_running",
+                "source": "plugin",
+                "input_mode": _gateway_command_input_mode(args_hint),
+                "execution_mode": "metadata_only",
+            })
+    if include_skills:
+        for record in _iter_skill_command_records():
+            records.append(record)
+    return records
+
+
+def _iter_skill_command_records() -> list[dict[str, Any]]:
+    """Return safe metadata records for skill slash commands.
+
+    The skill scanner keeps local paths so the runtime can load the skill. The
+    API/Homebase registry must not expose those paths or skill contents.
+    """
+    try:
+        from agent.skill_commands import get_skill_commands
+    except Exception:
+        return []
+    try:
+        commands = get_skill_commands() or {}
+    except Exception:
+        return []
+    records: list[dict[str, Any]] = []
+    for slash_name, meta in commands.items():
+        if not isinstance(slash_name, str) or not isinstance(meta, dict):
+            continue
+        name = slash_name.strip().lstrip("/").lower().replace("_", "-")
+        if not name:
+            continue
+        skill_name = str(meta.get("name") or name)
+        description = f"Invoke the {skill_name} skill"
+        records.append({
+            "name": name,
+            "aliases": [],
+            "description": description,
+            "category": "Skill",
+            "args_hint": "[instruction]",
+            "subcommands": [],
+            "risk": "agent_execution",
+            "gateway_supported": True,
+            "api_supported": False,
+            "supported": True,
+            "enabled": False,
+            "disabled_reason": "skill commands require an agent run and are not executed as read-only API commands yet",
+            "mid_run": "busy_if_running",
+            "source": "skill",
+            "input_mode": "text",
+            "execution_mode": "run",
+        })
+    return records
+
+
 def _iter_plugin_command_entries() -> list[tuple[str, str, str]]:
     """Yield (name, description, args_hint) tuples for all plugin slash commands.
 
