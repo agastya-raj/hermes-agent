@@ -292,6 +292,101 @@ class TestChannelInfo:
 
 
 # ---------------------------------------------------------------------------
+# Actions: create_channel / delete_channel
+# ---------------------------------------------------------------------------
+
+class TestChannelManagement:
+    @patch("tools.discord_tool._discord_request")
+    def test_create_text_channel(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {
+            "id": "900",
+            "name": "ops-room",
+            "type": 0,
+            "guild_id": "111",
+            "parent_id": "10",
+            "topic": "Operational notes",
+            "nsfw": False,
+            "position": 7,
+            "rate_limit_per_user": 5,
+        }
+
+        result = json.loads(discord_admin_handler(
+            action="create_channel",
+            guild_id="111",
+            name="ops-room",
+            channel_type="text",
+            parent_id="10",
+            topic="Operational notes",
+            nsfw=True,
+            position=7,
+            rate_limit_per_user=5,
+        ))
+
+        assert result["success"] is True
+        assert result["channel_id"] == "900"
+        assert result["type"] == "text"
+        mock_req.assert_called_once_with(
+            "POST", "/guilds/111/channels", "test-token",
+            body={
+                "name": "ops-room",
+                "type": 0,
+                "parent_id": "10",
+                "topic": "Operational notes",
+                "nsfw": True,
+                "position": 7,
+                "rate_limit_per_user": 5,
+            },
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_category_channel_omits_text_only_fields(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "901", "name": "Ops", "type": 4, "guild_id": "111"}
+
+        result = json.loads(discord_admin_handler(
+            action="create_channel",
+            guild_id="111",
+            name="Ops",
+            channel_type="category",
+            topic="ignored",
+            rate_limit_per_user=30,
+        ))
+
+        assert result["success"] is True
+        assert result["type"] == "category"
+        mock_req.assert_called_once_with(
+            "POST", "/guilds/111/channels", "test-token",
+            body={"name": "Ops", "type": 4},
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_channel_rejects_unknown_type(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_admin_handler(
+            action="create_channel",
+            guild_id="111",
+            name="bad",
+            channel_type="spaceship",
+        ))
+        assert "error" in result
+        assert "Unsupported channel_type" in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_delete_channel(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "900", "name": "ops-room", "type": 0}
+
+        result = json.loads(discord_admin_handler(action="delete_channel", channel_id="900"))
+
+        assert result["success"] is True
+        assert "deleted" in result["message"]
+        assert result["channel_id"] == "900"
+        mock_req.assert_called_once_with("DELETE", "/channels/900", "test-token")
+
+
+# ---------------------------------------------------------------------------
 # Action: list_roles
 # ---------------------------------------------------------------------------
 
@@ -577,11 +672,12 @@ class TestRegistration:
 
     def test_schema_parameter_bounds(self):
         from tools.registry import registry
-        entry = registry._tools["discord"]
+        entry = registry._tools["discord_admin"]
         props = entry.schema["parameters"]["properties"]
         assert props["limit"]["minimum"] == 1
         assert props["limit"]["maximum"] == 100
         assert props["auto_archive_duration"]["enum"] == [60, 1440, 4320, 10080]
+        assert props["channel_type"]["enum"] == ["text", "voice", "category", "announcement", "forum"]
 
     def test_core_schema_description(self):
         """Core schema description should mention core actions."""
@@ -601,6 +697,8 @@ class TestRegistration:
         entry = registry._tools["discord_admin"]
         desc = entry.schema["description"]
         assert "list_guilds()" in desc
+        assert "create_channel(guild_id, name)" in desc
+        assert "delete_channel(channel_id)" in desc
         assert "add_role(guild_id, user_id, role_id)" in desc
         assert "delete_message(channel_id, message_id)" in desc
         # Core actions should NOT be in admin description
