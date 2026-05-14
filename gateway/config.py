@@ -801,6 +801,10 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_user_allowed_commands"] = platform_cfg["group_user_allowed_commands"]
                 if plat in {Platform.DISCORD, Platform.SLACK} and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
+                if plat == Platform.DISCORD and "recent_context_channels" in platform_cfg:
+                    bridged["recent_context_channels"] = platform_cfg["recent_context_channels"]
+                if plat == Platform.DISCORD and "recent_context_limit" in platform_cfg:
+                    bridged["recent_context_limit"] = platform_cfg["recent_context_limit"]
                 if plat == Platform.DISCORD and "buzzer_url" in platform_cfg:
                     bridged["buzzer_url"] = platform_cfg["buzzer_url"]
                 if plat == Platform.DISCORD and "buzzer_channels" in platform_cfg:
@@ -871,6 +875,11 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
                 if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
                     os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
+                # allow_bots: "none" | "mentions" | "all".  Use "mentions"
+                # for multi-agent rooms so peer bots can intentionally hand off
+                # without their ambient chatter triggering loops.
+                if "allow_bots" in discord_cfg and not os.getenv("DISCORD_ALLOW_BOTS"):
+                    os.environ["DISCORD_ALLOW_BOTS"] = str(discord_cfg["allow_bots"]).lower()
                 # ignored_channels: channels where bot never responds (even when mentioned)
                 ic = discord_cfg.get("ignored_channels")
                 if ic is not None and not os.getenv("DISCORD_IGNORED_CHANNELS"):

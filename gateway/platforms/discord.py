@@ -4084,6 +4084,80 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
+    def _discord_recent_context_channels(self) -> set:
+        """Return Discord channel IDs where recent channel history should be injected.
+
+        This is intentionally separate from bot-message triggering: bot-authored
+        messages can be included as passive context for a human-triggered turn
+        without letting those bot messages start new agent runs on their own.
+        """
+        raw = self.config.extra.get("recent_context_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_RECENT_CONTEXT_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        s = str(raw).strip() if raw is not None else ""
+        if s:
+            return {part.strip() for part in s.split(",") if part.strip()}
+        return set()
+
+    def _discord_recent_context_limit(self) -> int:
+        raw = self.config.extra.get("recent_context_limit")
+        if raw is None:
+            raw = os.getenv("DISCORD_RECENT_CONTEXT_LIMIT", "5")
+        try:
+            return max(0, min(int(raw), 20))
+        except (TypeError, ValueError):
+            return 5
+
+    async def _recent_discord_context_for_message(self, message: DiscordMessage, channel_ids: set) -> str | None:
+        """Fetch a compact transcript of recent messages before ``message``.
+
+        Used for shared rooms with multiple agents: Luna can see that Ramona
+        already answered when Agastya speaks, while the existing on_message bot
+        filter still prevents Ramona's own messages from triggering Luna.
+        """
+        context_channels = self._discord_recent_context_channels()
+        if not context_channels or ("*" not in context_channels and not (channel_ids & context_channels)):
+            return None
+        limit = self._discord_recent_context_limit()
+        if limit <= 0:
+            return None
+
+        entries = []
+        try:
+            async for prior in message.channel.history(limit=limit, before=message.created_at):
+                if str(getattr(prior, "id", "")) == str(getattr(message, "id", "")):
+                    continue
+                author = getattr(prior, "author", None)
+                name = getattr(author, "display_name", None) or getattr(author, "name", None) or "unknown"
+                if getattr(author, "bot", False):
+                    name = f"{name} (bot/agent)"
+                content = (getattr(prior, "content", None) or "").strip()
+                if getattr(prior, "attachments", None):
+                    attachment_names = [getattr(att, "filename", "attachment") for att in prior.attachments[:3]]
+                    suffix = "[attachments: " + ", ".join(attachment_names) + "]"
+                    content = f"{content} {suffix}".strip()
+                if not content:
+                    continue
+                content = re.sub(r"\s+", " ", content)
+                if len(content) > 500:
+                    content = content[:497].rstrip() + "..."
+                entries.append((getattr(prior, "created_at", None), f"- {name}: {content}"))
+        except Exception as e:
+            logger.debug("[%s] Failed to fetch recent Discord context: %s", self.name, e, exc_info=True)
+            return None
+
+        if not entries:
+            return None
+
+        entries.sort(key=lambda item: item[0] or 0)
+        return (
+            "[Recent Discord channel context before Agastya's current message. "
+            "This is passive context only; do not answer old messages unless relevant.]\n"
+            + "\n".join(line for _, line in entries)
+        )
+
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
@@ -4909,6 +4983,13 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
         _chan_id = str(getattr(_chan, "id", ""))
+        _context_channel_ids = {_chan_id}
+        if _parent_id:
+            _context_channel_ids.add(_parent_id)
+        if not getattr(message.author, "bot", False):
+            _recent_context = await self._recent_discord_context_for_message(message, _context_channel_ids)
+            if _recent_context:
+                event_text = f"{_recent_context}\n\n[Current message]\n{event_text}"
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
 
