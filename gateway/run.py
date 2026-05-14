@@ -970,6 +970,47 @@ def _load_gateway_config() -> dict:
     return {}
 
 
+def _config_list(value: Any) -> set[str]:
+    """Normalize comma-separated/list config values into stripped strings."""
+    if value in (None, ""):
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        entries = value
+    else:
+        entries = str(value).split(",")
+    return {str(item).strip() for item in entries if str(item).strip()}
+
+
+def _discord_streaming_disabled_for_source(config: dict, source: "SessionSource") -> bool:
+    """Return True when Discord streaming is disabled for this channel/thread.
+
+    Global/per-platform streaming flags are intentionally coarse. Shared-agent
+    rooms need a narrower switch so queue arbitration sees complete candidate
+    replies while Telegram and other Discord channels can keep streaming.
+    """
+    if getattr(source, "platform", None) != Platform.DISCORD:
+        return False
+    cfg = config if isinstance(config, dict) else {}
+    discord_cfg = cfg.get("discord") if isinstance(cfg.get("discord"), dict) else {}
+    platforms_cfg = cfg.get("platforms") if isinstance(cfg.get("platforms"), dict) else {}
+    platform_cfg = platforms_cfg.get("discord") if isinstance(platforms_cfg.get("discord"), dict) else {}
+    platform_extra = platform_cfg.get("extra") if isinstance(platform_cfg.get("extra"), dict) else {}
+    disabled = set()
+    for section in (discord_cfg, platform_extra):
+        if not isinstance(section, dict):
+            continue
+        disabled.update(_config_list(section.get("streaming_disabled_channels")))
+        disabled.update(_config_list(section.get("streaming_disabled_channel_ids")))
+    if not disabled:
+        return False
+    source_ids = _config_list([
+        getattr(source, "chat_id", None),
+        getattr(source, "thread_id", None),
+        getattr(source, "parent_chat_id", None),
+    ])
+    return "*" in disabled or bool(source_ids & disabled)
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -13929,6 +13970,8 @@ class GatewayRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if _streaming_enabled and _discord_streaming_disabled_for_source(user_config, source):
+            _streaming_enabled = False
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -14742,6 +14785,8 @@ class GatewayRunner:
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            if _streaming_enabled and _discord_streaming_disabled_for_source(user_config, source):
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
