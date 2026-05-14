@@ -2432,6 +2432,13 @@ class BasePlatformAdapter(ABC):
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
+        # Some adapters can intentionally veto delivery after a pre-send
+        # coordination check (e.g. Discord Buzzer revalidate).  Do not treat
+        # that as a formatting failure and do not send a fallback, or the veto
+        # would be bypassed.
+        if error_str == "buzzer_revalidate_denied":
+            return result
+
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
         if not is_network and self._is_timeout_error(error_str):
