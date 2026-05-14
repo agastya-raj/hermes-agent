@@ -127,6 +127,44 @@ class TestHandleResumeCommand:
         db.close()
 
     @pytest.mark.asyncio
+    async def test_resume_by_exact_session_id(self, tmp_path):
+        """Resolves an exact session ID and switches to that session."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("20260509_132038_9d36cd", "telegram")
+        db.set_session_title("20260509_132038_9d36cd", "My Project")
+        db.create_session("current_session_001", "telegram")
+
+        event = _make_event(text="/resume 20260509_132038_9d36cd")
+        runner = _make_runner(session_db=db, current_session_id="current_session_001",
+                              event=event)
+        result = await runner._handle_resume_command(event)
+
+        assert "Resumed" in result
+        call_args = runner.session_store.switch_session.call_args
+        assert call_args[0][1] == "20260509_132038_9d36cd"
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_resume_by_unique_session_id_prefix(self, tmp_path):
+        """Resolves a unique session ID prefix and switches to that session."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("20260509_132038_9d36cd", "telegram")
+        db.set_session_title("20260509_132038_9d36cd", "My Project")
+        db.create_session("current_session_001", "telegram")
+
+        event = _make_event(text="/resume 20260509_132038_9d36")
+        runner = _make_runner(session_db=db, current_session_id="current_session_001",
+                              event=event)
+        result = await runner._handle_resume_command(event)
+
+        assert "Resumed" in result
+        call_args = runner.session_store.switch_session.call_args
+        assert call_args[0][1] == "20260509_132038_9d36cd"
+        db.close()
+
+    @pytest.mark.asyncio
     async def test_resume_nonexistent_name(self, tmp_path):
         """Returns error for unknown session name."""
         from hermes_state import SessionDB

@@ -11364,8 +11364,11 @@ class GatewayRunner:
                 logger.debug("Failed to list titled sessions: %s", e)
                 return t("gateway.resume.list_failed", error=e)
 
-        # Resolve the name to a session ID.
-        target_id = self._session_db.resolve_session_by_title(name)
+        # Resolve to a session ID. Prefer exact/unique ID prefixes, then fall
+        # back to title lookup so gateway /resume matches CLI semantics.
+        target_id = self._session_db.resolve_session_id(name)
+        if not target_id:
+            target_id = self._session_db.resolve_session_by_title(name)
         if not target_id:
             return t("gateway.resume.not_found", name=name)
         # Compression creates child continuations that hold the live transcript.
