@@ -1267,6 +1267,16 @@ DEFAULT_CONFIG = {
         # list_roles, member_info, search_members, fetch_messages, list_pins,
         # pin_message, unpin_message, create_thread, add_role, remove_role.
         "server_actions": "",
+        # Channel IDs where gateway streaming is always disabled. Useful for
+        # shared rooms where final sends are arbitrated by Buzzer.
+        "streaming_disabled_channels": "",
+        # Channel IDs where recent Discord channel context is added as
+        # transient, non-persisted model context.
+        "recent_context_channels": "",
+        "recent_context_limit": 5,
+        "recent_context_max_chars": 1500,
+        "recent_context_include_bots": True,
+        "buzzer_state_ttl_seconds": 86400,
     },
 
     # WhatsApp platform settings (gateway mode)

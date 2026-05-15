@@ -1,11 +1,15 @@
 import asyncio
+import json
+import os
+import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import sys
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 
 
 def _ensure_discord_mock():
@@ -216,6 +220,96 @@ def test_buzzer_queue_disables_gateway_streaming_for_managed_channel():
     assert adapter.should_disable_gateway_streaming(chat_id="999") is False
 
 
+def test_streaming_disabled_channels_disable_gateway_streaming_without_buzzer():
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "streaming_disabled_channels": [
+                    "discord:channel:1503787550",
+                ],
+            },
+        )
+    )
+    message = SimpleNamespace(
+        channel=SimpleNamespace(id=999, parent_id=1503787550),
+    )
+    event = SimpleNamespace(raw_message=message)
+
+    assert adapter.should_disable_gateway_streaming(event, chat_id="999") is True
+    assert adapter.should_disable_gateway_streaming(chat_id="discord:channel:1503787550") is True
+    assert adapter.should_disable_gateway_streaming(chat_id="123") is False
+
+
+def test_streaming_disabled_channels_support_wildcard_and_buzzer_mode():
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "buzzer_queue_enabled": True,
+                "buzzer_token": "test-token",
+                "buzzer_channels": ["123"],
+                "streaming_disabled_channels": ["*"],
+            },
+        )
+    )
+
+    assert adapter.should_disable_gateway_streaming(chat_id="999") is True
+
+
+def test_streaming_disabled_channels_normalize_raw_chat_id():
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"streaming_disabled_channels": ["1503787550"]},
+        )
+    )
+
+    assert adapter.should_disable_gateway_streaming(chat_id="discord:channel:1503787550") is True
+
+
+def test_streaming_disabled_channels_load_from_discord_config():
+    from gateway.config import load_gateway_config
+
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "config.yaml").write_text(
+        (
+            "discord:\n"
+            "  streaming_disabled_channels:\n"
+            "    - '1503787550'\n"
+            "  recent_context_channels:\n"
+            "    - '1503787550'\n"
+            "  recent_context_limit: 3\n"
+            "  recent_context_max_chars: 1500\n"
+            "  recent_context_include_bots: true\n"
+            "  buzzer_state_ttl_seconds: 86400\n"
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_gateway_config()
+
+    assert (
+        config.platforms[Platform.DISCORD].extra["streaming_disabled_channels"]
+        == ["1503787550"]
+    )
+    assert os.environ["DISCORD_STREAMING_DISABLED_CHANNELS"] == "1503787550"
+    assert config.platforms[Platform.DISCORD].extra["recent_context_channels"] == ["1503787550"]
+    assert config.platforms[Platform.DISCORD].extra["recent_context_limit"] == 3
+    assert config.platforms[Platform.DISCORD].extra["recent_context_max_chars"] == 1500
+    assert config.platforms[Platform.DISCORD].extra["recent_context_include_bots"] is True
+    assert config.platforms[Platform.DISCORD].extra["buzzer_state_ttl_seconds"] == 86400
+    assert os.environ["DISCORD_RECENT_CONTEXT_CHANNELS"] == "1503787550"
+    assert os.environ["DISCORD_RECENT_CONTEXT_LIMIT"] == "3"
+    assert os.environ["DISCORD_RECENT_CONTEXT_MAX_CHARS"] == "1500"
+    assert os.environ["DISCORD_RECENT_CONTEXT_INCLUDE_BOTS"] == "true"
+    assert os.environ["BUZZER_STATE_TTL_SECONDS"] == "86400"
+
+
 @pytest.mark.asyncio
 async def test_buzzer_queue_send_correlates_by_event_metadata_without_reply_to():
     adapter = DiscordAdapter(
@@ -260,6 +354,232 @@ async def test_buzzer_queue_send_correlates_by_event_metadata_without_reply_to()
     assert captured_payloads[0]["roomId"] == "1503787550"
     assert captured_payloads[0]["conversationId"] == "1503787550"
     assert captured_payloads[0]["candidateText"] == "hello from Luna"
+
+
+def _buzzer_state_path() -> Path:
+    return Path(os.environ["HERMES_HOME"]) / "gateway" / "discord_buzzer_state.json"
+
+
+def _buzzer_message(
+    *,
+    message_id="1504627246",
+    channel_id="1503787550",
+    parent_id=None,
+    content="hello Luna",
+):
+    return SimpleNamespace(
+        id=message_id,
+        content=content,
+        channel=SimpleNamespace(id=channel_id, parent_id=parent_id),
+        guild=SimpleNamespace(id=999),
+    )
+
+
+@pytest.mark.asyncio
+async def test_buzzer_queue_state_survives_adapter_restart():
+    config = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={
+            "buzzer_queue_enabled": True,
+            "buzzer_token": "test-token",
+            "buzzer_channels": ["1503787550"],
+        },
+    )
+    adapter = DiscordAdapter(config)
+    adapter._post_buzzer_sync = lambda endpoint, payload: (True, {}, None)
+
+    await adapter._observe_buzzer_turn(_buzzer_message())
+
+    restarted = DiscordAdapter(config)
+
+    assert "1504627246" in restarted._buzzer_queue_messages
+    restored = restarted._buzzer_queue_messages["1504627246"]
+    assert restored["roomId"] == "1503787550"
+    assert restored["directAddressed"] is True
+    data = json.loads(_buzzer_state_path().read_text(encoding="utf-8"))
+    state_payload = data["turns"]["1504627246"]["payload"]
+    assert "candidateText" not in state_payload
+
+
+@pytest.mark.asyncio
+async def test_buzzer_claim_state_survives_restart_and_finish_is_idempotent():
+    config = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={
+            "buzzer_token": "test-token",
+            "buzzer_channels": ["1503787550"],
+        },
+    )
+    message = _buzzer_message(content="ambient chatter")
+    adapter = DiscordAdapter(config)
+    adapter._post_buzzer_sync = lambda endpoint, payload: (
+        True,
+        {"claimId": "claim-1", "allowed": True},
+        None,
+    )
+
+    assert await adapter._claim_buzzer_turn(message, direct_addressed=False) is True
+
+    restarted = DiscordAdapter(config)
+    calls = []
+
+    def fake_post(endpoint, payload):
+        calls.append((endpoint, dict(payload)))
+        return True, {"ok": True}, None
+
+    restarted._post_buzzer_sync = fake_post
+
+    await restarted._finish_buzzer_turn(message)
+    await restarted._finish_buzzer_turn(message)
+
+    assert [endpoint for endpoint, _ in calls] == ["finish"]
+    assert calls[0][1]["claimId"] == "claim-1"
+    data = json.loads(_buzzer_state_path().read_text(encoding="utf-8"))
+    assert data["turns"]["1504627246"]["state"] == "finished"
+
+
+def test_buzzer_state_ttl_expires_old_pending_entries():
+    path = _buzzer_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old = time.time() - 120
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "turns": {
+                    "old-message": {
+                        "state": "queued",
+                        "messageId": "old-message",
+                        "roomId": "1503787550",
+                        "conversationId": "1503787550",
+                        "createdAt": old,
+                        "updatedAt": old,
+                        "payload": {
+                            "roomId": "1503787550",
+                            "conversationId": "1503787550",
+                            "messageId": "old-message",
+                            "directAddressed": False,
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"buzzer_state_ttl_seconds": 60},
+        )
+    )
+
+    assert "old-message" not in adapter._buzzer_queue_messages
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["turns"]["old-message"]["state"] == "expired"
+
+
+@pytest.mark.asyncio
+async def test_buzzer_queue_unavailable_fails_closed_even_when_direct_addressed():
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"buzzer_queue_enabled": True},
+        )
+    )
+    adapter._buzzer_queue_messages["1504627246"] = {
+        "roomId": "1503787550",
+        "conversationId": "1503787550",
+        "messageId": "1504627246",
+        "directAddressed": True,
+        "intent": "direct_address",
+        "enthusiasm": 8,
+    }
+    adapter._post_buzzer_queue_sync = lambda payload: (False, {}, "network down")
+
+    channel = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(id=1234)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send(
+        "1503787550",
+        "candidate text that must not post",
+        metadata={
+            "notify": True,
+            "eventMessageId": "1504627246",
+            "conversationId": "discord:channel:1503787550",
+        },
+    )
+
+    assert result.success is True
+    assert result.message_id is None
+    assert result.raw_response["reason"] == "queue_unavailable_fail_closed"
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_buzzer_superseded_state_omits_candidate_and_winner_text():
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"buzzer_queue_enabled": True},
+        )
+    )
+    adapter._buzzer_queue_messages["1504627246"] = {
+        "roomId": "1503787550",
+        "conversationId": "1503787550",
+        "messageId": "1504627246",
+        "directAddressed": False,
+        "intent": "ambient",
+        "enthusiasm": 2,
+    }
+    adapter._post_buzzer_queue_sync = lambda payload: (
+        True,
+        {
+            "status": "superseded",
+            "winnerAgent": "ramona",
+            "winnerText": "Ramona posted this full text",
+        },
+        None,
+    )
+
+    channel = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(id=1234)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send(
+        "1503787550",
+        "candidate text that must stay transient",
+        metadata={
+            "notify": True,
+            "eventMessageId": "1504627246",
+            "conversationId": "discord:channel:1503787550",
+        },
+    )
+
+    assert result.success is True
+    assert result.message_id is None
+    channel.send.assert_not_awaited()
+    data = json.loads(_buzzer_state_path().read_text(encoding="utf-8"))
+    record = data["turns"]["1504627246"]
+    assert record["state"] == "superseded"
+    serialized = json.dumps(record)
+    assert "candidate text" not in serialized
+    assert "winnerText" not in serialized
+    assert "Ramona posted this full text" not in serialized
 
 
 # ---------------------------------------------------------------------------

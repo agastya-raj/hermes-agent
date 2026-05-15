@@ -956,6 +956,10 @@ class MessageEvent:
     # Per-channel ephemeral system prompt (e.g. Discord channel_prompts).
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
+
+    # Per-message context that should be visible to the model for the current
+    # turn only.  Unlike ``text``, this is never written to transcript history.
+    ephemeral_context: Optional[str] = None
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.

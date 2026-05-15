@@ -32,6 +32,30 @@ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+_DISCORD_BUZZER_STATE_FILENAME = "discord_buzzer_state.json"
+_DISCORD_BUZZER_STATE_VERSION = 1
+_DISCORD_BUZZER_TERMINAL_STATES = {"finished", "failed", "quiet", "superseded", "dropped", "expired"}
+_DISCORD_BUZZER_PAYLOAD_KEYS = {
+    "agent",
+    "platform",
+    "roomId",
+    "conversationId",
+    "messageId",
+    "legacyRoomId",
+    "guild_id",
+    "channel_id",
+    "parent_channel_id",
+    "message_id",
+    "intent",
+    "purpose",
+    "confidence",
+    "enthusiasm",
+    "directAddressed",
+    "slot",
+    "claimId",
+    "followUpOf",
+    "followUpReason",
+}
 
 try:
     import discord
@@ -598,9 +622,12 @@ class DiscordAdapter(BasePlatformAdapter):
         self._buzzer_claimed_messages: dict[str, dict[str, Any]] = {}
         self._buzzer_queue_messages: dict[str, dict[str, Any]] = {}
         self._buzzer_superseded_messages: dict[str, dict[str, Any]] = {}
+        self._buzzer_runtime_turns: dict[str, dict[str, Any]] = {}
+        self._buzzer_state_lock = threading.RLock()
         self._buzzer_claim_lock = asyncio.Lock()
         self._buzzer_burst_delay_seconds = float(os.getenv("BUZZER_BURST_DELAY_SECONDS", "2.0"))
         self._buzzer_default_purpose = os.getenv("BUZZER_DEFAULT_PURPOSE", "other")
+        self._load_buzzer_runtime_state()
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -1391,7 +1418,26 @@ class DiscordAdapter(BasePlatformAdapter):
             entries = raw
         else:
             entries = str(raw or "").split(",")
-        return {str(ch).strip() for ch in entries if str(ch).strip()}
+        return {
+            self._normalize_buzzer_room_id(ch)
+            for ch in entries
+            if self._normalize_buzzer_room_id(ch)
+        }
+
+    def _streaming_disabled_channels(self) -> set[str]:
+        """Return Discord channel ids where gateway token streaming is disabled."""
+        raw = self.config.extra.get("streaming_disabled_channels")
+        if raw in (None, ""):
+            raw = os.getenv("DISCORD_STREAMING_DISABLED_CHANNELS", "")
+        if isinstance(raw, (list, tuple, set)):
+            entries = raw
+        else:
+            entries = str(raw or "").split(",")
+        return {
+            self._normalize_buzzer_room_id(entry)
+            for entry in entries
+            if self._normalize_buzzer_room_id(entry)
+        }
 
     def _buzzer_url(self) -> str:
         raw = (
@@ -1416,6 +1462,195 @@ class DiscordAdapter(BasePlatformAdapter):
         if isinstance(raw, bool):
             return raw
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _buzzer_state_ttl_seconds(self) -> float:
+        raw = self.config.extra.get("buzzer_state_ttl_seconds")
+        if raw is None:
+            raw = os.getenv("BUZZER_STATE_TTL_SECONDS", "86400")
+        try:
+            return max(60.0, float(raw))
+        except (TypeError, ValueError):
+            return 86400.0
+
+    def _buzzer_runtime_state_path(self) -> _Path:
+        from hermes_constants import get_hermes_home
+
+        directory = get_hermes_home() / "gateway"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return directory / _DISCORD_BUZZER_STATE_FILENAME
+
+    @staticmethod
+    def _buzzer_record_timestamp(record: dict[str, Any]) -> float:
+        for key in ("updatedAt", "createdAt"):
+            try:
+                return float(record.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    def _sanitize_buzzer_payload(self, payload: Optional[dict[str, Any]]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        clean = {
+            key: value
+            for key, value in payload.items()
+            if key in _DISCORD_BUZZER_PAYLOAD_KEYS and value is not None
+        }
+        for key in ("roomId", "conversationId", "messageId", "channel_id", "parent_channel_id", "message_id"):
+            if key in clean:
+                clean[key] = str(clean[key])
+        return clean
+
+    def _buzzer_runtime_record(
+        self,
+        msg_id: str,
+        payload: Optional[dict[str, Any]],
+        state: str,
+        *,
+        reason: Optional[str] = None,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        existing = self._buzzer_runtime_turns.get(str(msg_id), {})
+        clean_payload = self._sanitize_buzzer_payload(payload)
+        room_id = self._normalize_buzzer_room_id(
+            clean_payload.get("roomId") or clean_payload.get("conversationId") or ""
+        )
+        record: dict[str, Any] = {
+            "state": state,
+            "messageId": str(msg_id),
+            "roomId": room_id,
+            "conversationId": room_id,
+            "platform": "discord",
+            "agent": "luna",
+            "createdAt": existing.get("createdAt") or now,
+            "updatedAt": now,
+            "payload": clean_payload,
+        }
+        if "directAddressed" in clean_payload:
+            record["directAddressed"] = bool(clean_payload.get("directAddressed"))
+        if clean_payload.get("slot"):
+            record["slot"] = str(clean_payload["slot"])
+        if clean_payload.get("claimId"):
+            record["claimId"] = str(clean_payload["claimId"])
+        if reason:
+            record["reason"] = str(reason)[:200]
+        if isinstance(extra, dict):
+            for key in ("winnerAgent", "status", "reason", "directAddressed", "slot", "claimId", "error"):
+                if key in extra and extra[key] is not None:
+                    value = extra[key]
+                    if isinstance(value, str):
+                        value = value[:200]
+                    record[key] = value
+        return record
+
+    def _sweep_buzzer_runtime_state_locked(self) -> bool:
+        ttl = self._buzzer_state_ttl_seconds()
+        now = time.time()
+        changed = False
+        for msg_id, record in list(self._buzzer_runtime_turns.items()):
+            if not isinstance(record, dict):
+                self._buzzer_runtime_turns.pop(msg_id, None)
+                changed = True
+                continue
+            updated = self._buzzer_record_timestamp(record) or now
+            if now - updated <= ttl:
+                continue
+            state = str(record.get("state") or "")
+            if state in _DISCORD_BUZZER_TERMINAL_STATES:
+                self._buzzer_runtime_turns.pop(msg_id, None)
+            else:
+                expired = dict(record)
+                expired["state"] = "expired"
+                expired["reason"] = "ttl_expired"
+                expired["updatedAt"] = now
+                self._buzzer_runtime_turns[msg_id] = expired
+                self._buzzer_queue_messages.pop(msg_id, None)
+                self._buzzer_claimed_messages.pop(msg_id, None)
+            changed = True
+        return changed
+
+    def _write_buzzer_runtime_state_locked(self) -> None:
+        self._sweep_buzzer_runtime_state_locked()
+        payload = {
+            "version": _DISCORD_BUZZER_STATE_VERSION,
+            "updatedAt": time.time(),
+            "turns": self._buzzer_runtime_turns,
+        }
+        atomic_json_write(
+            self._buzzer_runtime_state_path(),
+            payload,
+            indent=None,
+            separators=(",", ":"),
+        )
+
+    def _restore_buzzer_runtime_memory_locked(self) -> None:
+        self._buzzer_queue_messages.clear()
+        self._buzzer_claimed_messages.clear()
+        self._buzzer_superseded_messages.clear()
+        for msg_id, record in self._buzzer_runtime_turns.items():
+            if not isinstance(record, dict):
+                continue
+            state = str(record.get("state") or "")
+            if state in _DISCORD_BUZZER_TERMINAL_STATES:
+                continue
+            payload = self._sanitize_buzzer_payload(record.get("payload"))
+            if not payload:
+                continue
+            if state == "claimed":
+                self._buzzer_claimed_messages[msg_id] = {
+                    "slot": record.get("slot") or payload.get("slot"),
+                    "claimId": record.get("claimId") or payload.get("claimId"),
+                    "payload": payload,
+                }
+            else:
+                self._buzzer_queue_messages[msg_id] = payload
+
+    def _load_buzzer_runtime_state(self) -> None:
+        with self._buzzer_state_lock:
+            try:
+                path = self._buzzer_runtime_state_path()
+                if not path.exists():
+                    return
+                data = json.loads(path.read_text(encoding="utf-8"))
+                turns = data.get("turns") if isinstance(data, dict) else {}
+                if not isinstance(turns, dict):
+                    return
+                self._buzzer_runtime_turns = {
+                    str(msg_id): dict(record)
+                    for msg_id, record in turns.items()
+                    if isinstance(record, dict)
+                }
+                changed = self._sweep_buzzer_runtime_state_locked()
+                self._restore_buzzer_runtime_memory_locked()
+                if changed:
+                    self._write_buzzer_runtime_state_locked()
+            except Exception as exc:
+                logger.debug("[Discord] Failed to load Buzzer runtime state: %s", exc, exc_info=True)
+
+    def _record_buzzer_turn(
+        self,
+        msg_id: str,
+        payload: Optional[dict[str, Any]],
+        state: str,
+        *,
+        reason: Optional[str] = None,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> None:
+        if not msg_id:
+            return
+        with self._buzzer_state_lock:
+            self._buzzer_runtime_turns[str(msg_id)] = self._buzzer_runtime_record(
+                str(msg_id),
+                payload,
+                state,
+                reason=reason,
+                extra=extra,
+            )
+            self._write_buzzer_runtime_state_locked()
 
     def _message_channel_ids(self, message: DiscordMessage) -> set[str]:
         channel_ids = {str(getattr(message.channel, "id", ""))}
@@ -1620,6 +1855,7 @@ class DiscordAdapter(BasePlatformAdapter):
             queue_payload.update(self._classify_buzzer_turn(message, direct))
             queue_payload["directAddressed"] = direct
             self._buzzer_queue_messages[msg_id] = queue_payload
+            self._record_buzzer_turn(msg_id, queue_payload, "observed")
             logger.info(
                 "[Discord] Buzzer queue tracking %s for room %s",
                 msg_id,
@@ -1652,6 +1888,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "claimId": claim_id,
             "payload": claim_payload,
         }
+        self._record_buzzer_turn(msg_id, claim_payload, "claimed")
 
     def _buzzer_payload_for_claim(self, msg_id: str) -> Optional[dict]:
         claim = self._buzzer_claimed_messages.get(str(msg_id))
@@ -1677,11 +1914,18 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _complete_buzzer_turn(self, msg_id: str, endpoint: str, *, reason: str | None = None) -> None:
         payload = self._buzzer_payload_for_claim(msg_id)
         if not payload:
+            queue_payload = self._buzzer_queue_messages.get(str(msg_id))
+            if queue_payload:
+                terminal_state = "finished" if endpoint == "finish" else "failed"
+                self._record_buzzer_turn(str(msg_id), queue_payload, terminal_state, reason=reason)
+                self._buzzer_queue_messages.pop(str(msg_id), None)
             return
         if reason:
             payload["reason"] = reason
         ok, data, error = await asyncio.to_thread(self._post_buzzer_sync, endpoint, payload)
         if ok:
+            terminal_state = "finished" if endpoint == "finish" else "failed"
+            self._record_buzzer_turn(str(msg_id), payload, terminal_state, reason=reason)
             self._buzzer_claimed_messages.pop(str(msg_id), None)
         else:
             logger.warning("[Discord] Buzzer %s failed: %s %s", endpoint, error, data)
@@ -1698,12 +1942,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 payload.update(self._classify_buzzer_turn(message, direct_addressed))
                 payload["directAddressed"] = direct_addressed
                 self._buzzer_queue_messages[msg_id] = payload
-            return True
-        if direct_addressed:
+                self._record_buzzer_turn(msg_id, payload, "queued")
             return True
         async with self._buzzer_claim_lock:
             payload = self._buzzer_payload(message)
             payload.update(self._classify_buzzer_turn(message, direct_addressed))
+            payload["directAddressed"] = direct_addressed
             payload["slot"] = "first"
             ok, data, error = await asyncio.to_thread(self._post_buzzer_sync, "claim", payload)
             allowed = ok and self._buzzer_allowed(data)
@@ -1724,7 +1968,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         payload = self._buzzer_payload(message)
         ok, data, error = await asyncio.to_thread(self._post_buzzer_sync, "quiet", payload)
-        if not ok:
+        if ok:
+            msg_id = str(getattr(message, "id", ""))
+            self._record_buzzer_turn(msg_id, payload, "quiet")
+            self._buzzer_queue_messages.pop(msg_id, None)
+            self._buzzer_claimed_messages.pop(msg_id, None)
+        else:
             logger.debug("[Discord] Buzzer quiet failed: %s %s", error, data)
 
     async def _finish_buzzer_turn(self, message: DiscordMessage) -> None:
@@ -1825,6 +2074,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 msg_id,
                 room_id,
             )
+            self._record_buzzer_turn(str(msg_id), base, "queued", reason="fallback_correlation")
         room_id = self._normalize_buzzer_room_id(base.get("roomId") or base.get("conversationId") or "")
         payload = {
             "roomId": room_id,
@@ -1851,30 +2101,48 @@ class DiscordAdapter(BasePlatformAdapter):
             data = dict(data or {})
             data["error"] = error or data.get("error") or "queue_unavailable"
             data["directAddressed"] = bool(base.get("directAddressed"))
+            self._record_buzzer_turn(
+                str(msg_id),
+                base,
+                "failed",
+                reason="queue_unavailable",
+                extra={"error": data.get("error"), "directAddressed": data.get("directAddressed")},
+            )
             logger.warning("[Discord] Buzzer queue submit unavailable: %s %s", error, data)
             return "unavailable", data
         status = str(data.get("status") or "").lower()
         if status == "deliver":
+            self._record_buzzer_turn(str(msg_id), base, "queued", extra={"status": "deliver"})
             logger.info("[Discord] Buzzer queue deliver for %s in room %s", msg_id, room_id)
             return "deliver", data
         if status == "superseded":
-            stored = dict(data)
-            stored["candidateText"] = candidate_text
-            stored["payload"] = payload
+            stored = {
+                key: value
+                for key, value in dict(data).items()
+                if key not in {"candidateText", "winnerText"}
+            }
+            stored["payload"] = self._sanitize_buzzer_payload(base)
             self._buzzer_superseded_messages[str(msg_id)] = stored
             self._buzzer_queue_messages.pop(str(msg_id), None)
+            self._record_buzzer_turn(
+                str(msg_id),
+                base,
+                "superseded",
+                extra={"winnerAgent": data.get("winnerAgent"), "status": "superseded"},
+            )
             logger.info(
-                "[Discord] Buzzer queue superseded %s by %s: %s",
+                "[Discord] Buzzer queue superseded %s by %s",
                 msg_id,
                 data.get("winnerAgent"),
-                str(data.get("winnerText") or "")[:120],
             )
             return "superseded", data
         if status == "drop":
             self._buzzer_queue_messages.pop(str(msg_id), None)
+            self._record_buzzer_turn(str(msg_id), base, "dropped", reason=str(data.get("reason") or "drop"))
             logger.info("[Discord] Buzzer queue dropped %s: %s", msg_id, data.get("reason"))
             return "drop", data
         self._buzzer_queue_messages.pop(str(msg_id), None)
+        self._record_buzzer_turn(str(msg_id), base, "dropped", reason="unknown_queue_status")
         logger.warning("[Discord] Buzzer queue returned unknown status for %s: %s", msg_id, data)
         return "drop", data
 
@@ -1954,7 +2222,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             "reason": decision,
                         },
                     )
-                if decision == "unavailable" and not queue_data.get("directAddressed"):
+                if decision == "unavailable":
                     self._buzzer_queue_messages.pop(str(buzzer_turn_msg_id), None)
                     return SendResult(
                         success=True,
@@ -2016,7 +2284,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 message_ids.append(str(msg.id))
 
             if buzzer_turn_msg_id:
+                queue_payload = self._buzzer_queue_messages.get(str(buzzer_turn_msg_id))
                 await self._complete_buzzer_turn(buzzer_turn_msg_id, "finish")
+                if queue_payload:
+                    self._record_buzzer_turn(str(buzzer_turn_msg_id), queue_payload, "finished")
                 self._buzzer_queue_messages.pop(str(buzzer_turn_msg_id), None)
 
             return SendResult(
@@ -4161,12 +4432,33 @@ class DiscordAdapter(BasePlatformAdapter):
         raw = self.config.extra.get("recent_context_channels")
         if raw is None:
             raw = os.getenv("DISCORD_RECENT_CONTEXT_CHANNELS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        s = str(raw).strip() if raw is not None else ""
-        if s:
-            return {part.strip() for part in s.split(",") if part.strip()}
-        return set()
+        if isinstance(raw, (list, tuple, set)):
+            entries = raw
+        else:
+            s = str(raw).strip() if raw is not None else ""
+            entries = s.split(",") if s else []
+        return {
+            self._normalize_buzzer_room_id(part)
+            for part in entries
+            if self._normalize_buzzer_room_id(part)
+        }
+
+    def _discord_recent_context_max_chars(self) -> int:
+        raw = self.config.extra.get("recent_context_max_chars")
+        if raw is None:
+            raw = os.getenv("DISCORD_RECENT_CONTEXT_MAX_CHARS", "1500")
+        try:
+            return max(0, min(int(raw), 20000))
+        except (TypeError, ValueError):
+            return 1500
+
+    def _discord_recent_context_include_bots(self) -> bool:
+        raw = self.config.extra.get("recent_context_include_bots")
+        if raw is None:
+            raw = os.getenv("DISCORD_RECENT_CONTEXT_INCLUDE_BOTS", "true")
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
     def _discord_recent_context_limit(self) -> int:
         raw = self.config.extra.get("recent_context_limit")
@@ -4180,11 +4472,20 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _recent_discord_context_for_message(self, message: DiscordMessage, channel_ids: set) -> str | None:
         """Fetch a compact transcript of recent messages before message."""
         context_channels = self._discord_recent_context_channels()
-        if not context_channels or ("*" not in context_channels and not (channel_ids & context_channels)):
+        normalized_channel_ids = {
+            self._normalize_buzzer_room_id(ch)
+            for ch in (channel_ids or set())
+            if self._normalize_buzzer_room_id(ch)
+        }
+        if not context_channels or ("*" not in context_channels and not (normalized_channel_ids & context_channels)):
             return None
         limit = self._discord_recent_context_limit()
         if limit <= 0:
             return None
+        max_chars = self._discord_recent_context_max_chars()
+        if max_chars <= 0:
+            return None
+        include_bots = self._discord_recent_context_include_bots()
 
         entries = []
         try:
@@ -4193,7 +4494,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     continue
                 author = getattr(prior, "author", None)
                 name = getattr(author, "display_name", None) or getattr(author, "name", None) or "unknown"
-                if getattr(author, "bot", False):
+                is_bot = bool(getattr(author, "bot", False))
+                if is_bot and not include_bots:
+                    continue
+                if is_bot:
                     name = f"{name} (bot/agent)"
                 content = (getattr(prior, "content", None) or "").strip()
                 if getattr(prior, "attachments", None):
@@ -4213,16 +4517,47 @@ class DiscordAdapter(BasePlatformAdapter):
         if not entries:
             return None
 
-        entries.sort(
+        header = (
+            "[Recent Discord channel context before Agastya's current message. "
+            "This is passive context only; do not answer earlier messages unless relevant.]"
+        )
+        body_budget = max_chars - len(header) - 1
+        if body_budget <= 0:
+            return None
+
+        newest_first = sorted(
+            entries,
+            key=lambda item: item[0].timestamp()
+            if hasattr(item[0], "timestamp")
+            else 0,
+            reverse=True,
+        )
+        selected = []
+        used = 0
+        for created_at, line in newest_first:
+            separator = 1 if selected else 0
+            needed = separator + len(line)
+            if used + needed <= body_budget:
+                selected.append((created_at, line))
+                used += needed
+                continue
+            remaining = body_budget - used - separator
+            if remaining > 20:
+                selected.append((created_at, line[: max(0, remaining - 3)].rstrip() + "..."))
+            break
+
+        if not selected:
+            return None
+
+        selected.sort(
             key=lambda item: item[0].timestamp()
             if hasattr(item[0], "timestamp")
             else 0
         )
-        return (
-            "[Recent Discord channel context before Agastya's current message. "
-            "This is passive context only; do not answer old messages unless relevant.]\n"
-            + "\n".join(line for _, line in entries)
-        )
+        block = header + "\n" + "\n".join(line for _, line in selected)
+        if len(block) > max_chars:
+            block = block[: max(0, max_chars - 3)].rstrip() + "..."
+        return block
 
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
@@ -5150,10 +5485,9 @@ class DiscordAdapter(BasePlatformAdapter):
         _context_channel_ids = {_chan_id}
         if _parent_id:
             _context_channel_ids.add(_parent_id)
+        _recent_context = None
         if not getattr(message.author, "bot", False):
             _recent_context = await self._recent_discord_context_for_message(message, _context_channel_ids)
-            if _recent_context:
-                event_text = f"{_recent_context}\n\n[Current message]\n{event_text}"
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
 
@@ -5177,6 +5511,7 @@ class DiscordAdapter(BasePlatformAdapter):
             timestamp=message.created_at,
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
+            ephemeral_context=_recent_context,
         )
         event._buzzer_direct_addressed = direct_addressed_for_buzzer  # type: ignore[attr-defined]
 
@@ -5231,6 +5566,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 getattr(existing, "_buzzer_direct_addressed", False)
                 or getattr(event, "_buzzer_direct_addressed", False)
             )
+            if not existing.ephemeral_context and event.ephemeral_context:
+                existing.ephemeral_context = event.ephemeral_context
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -5249,15 +5586,26 @@ class DiscordAdapter(BasePlatformAdapter):
         chat_id: str | None = None,
     ) -> bool:
         """Return True when streaming would bypass Buzzer queue arbitration."""
+        disabled_channels = self._streaming_disabled_channels()
         if not self._buzzer_queue_enabled():
-            return False
+            raw_message = getattr(event, "raw_message", None) if event is not None else None
+            if raw_message is not None:
+                message_channels = self._message_channel_ids(raw_message)
+                return "*" in disabled_channels or bool(message_channels & disabled_channels)
+            return "*" in disabled_channels or self._normalize_buzzer_room_id(chat_id) in disabled_channels
+
         raw_message = getattr(event, "raw_message", None) if event is not None else None
         if raw_message is not None:
+            message_channels = self._message_channel_ids(raw_message)
+            if "*" in disabled_channels or bool(message_channels & disabled_channels):
+                return True
             return self._is_buzzer_enabled_for_message(raw_message)
+        if "*" in disabled_channels or self._normalize_buzzer_room_id(chat_id) in disabled_channels:
+            return True
         if not self._buzzer_token():
             return False
         channels = self._buzzer_channels()
-        return "*" in channels or str(chat_id or "") in channels
+        return "*" in channels or self._normalize_buzzer_room_id(chat_id) in channels
 
     async def _flush_text_batch(self, key: str) -> None:
         """Wait for the quiet period then dispatch the aggregated text.

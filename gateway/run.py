@@ -7632,6 +7632,7 @@ class GatewayRunner:
                     run_generation=run_generation,
                     event_message_id=self._reply_anchor_for_event(event),
                     channel_prompt=event.channel_prompt,
+                    ephemeral_context=getattr(event, "ephemeral_context", None),
                 )
             except Exception:
                 _latency_mark("run_agent:error")
@@ -14363,6 +14364,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        ephemeral_context: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -14376,6 +14378,9 @@ class GatewayRunner:
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        if ephemeral_context:
+            context_prompt = (context_prompt + "\n\n" + ephemeral_context.strip()).strip()
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -16228,6 +16233,7 @@ class GatewayRunner:
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_ephemeral_context = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -16245,6 +16251,7 @@ class GatewayRunner:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_ephemeral_context = getattr(pending_event, "ephemeral_context", None)
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -16270,6 +16277,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    ephemeral_context=next_ephemeral_context,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

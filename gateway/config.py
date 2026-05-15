@@ -843,16 +843,24 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["recent_context_channels"] = platform_cfg["recent_context_channels"]
                 if plat == Platform.DISCORD and "recent_context_limit" in platform_cfg:
                     bridged["recent_context_limit"] = platform_cfg["recent_context_limit"]
+                if plat == Platform.DISCORD and "recent_context_max_chars" in platform_cfg:
+                    bridged["recent_context_max_chars"] = platform_cfg["recent_context_max_chars"]
+                if plat == Platform.DISCORD and "recent_context_include_bots" in platform_cfg:
+                    bridged["recent_context_include_bots"] = platform_cfg["recent_context_include_bots"]
                 if plat == Platform.DISCORD and "buzzer_url" in platform_cfg:
                     bridged["buzzer_url"] = platform_cfg["buzzer_url"]
                 if plat == Platform.DISCORD and "buzzer_channels" in platform_cfg:
                     bridged["buzzer_channels"] = platform_cfg["buzzer_channels"]
+                if plat == Platform.DISCORD and "streaming_disabled_channels" in platform_cfg:
+                    bridged["streaming_disabled_channels"] = platform_cfg["streaming_disabled_channels"]
                 if plat == Platform.DISCORD and "buzzer_self_names" in platform_cfg:
                     bridged["buzzer_self_names"] = platform_cfg["buzzer_self_names"]
                 if plat == Platform.DISCORD and "buzzer_default_purpose" in platform_cfg:
                     bridged["buzzer_default_purpose"] = platform_cfg["buzzer_default_purpose"]
                 if plat == Platform.DISCORD and "buzzer_queue_enabled" in platform_cfg:
                     bridged["buzzer_queue_enabled"] = platform_cfg["buzzer_queue_enabled"]
+                if plat == Platform.DISCORD and "buzzer_state_ttl_seconds" in platform_cfg:
+                    bridged["buzzer_state_ttl_seconds"] = platform_cfg["buzzer_state_ttl_seconds"]
                 if "channel_prompts" in platform_cfg:
                     channel_prompts = platform_cfg["channel_prompts"]
                     if isinstance(channel_prompts, dict):
@@ -961,6 +969,22 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(bc, list):
                         bc = ",".join(str(v) for v in bc)
                     os.environ["DISCORD_BUZZER_CHANNELS"] = str(bc)
+                sdc = discord_cfg.get("streaming_disabled_channels")
+                if sdc is not None and not os.getenv("DISCORD_STREAMING_DISABLED_CHANNELS"):
+                    if isinstance(sdc, list):
+                        sdc = ",".join(str(v) for v in sdc)
+                    os.environ["DISCORD_STREAMING_DISABLED_CHANNELS"] = str(sdc)
+                rcc = discord_cfg.get("recent_context_channels")
+                if rcc is not None and not os.getenv("DISCORD_RECENT_CONTEXT_CHANNELS"):
+                    if isinstance(rcc, list):
+                        rcc = ",".join(str(v) for v in rcc)
+                    os.environ["DISCORD_RECENT_CONTEXT_CHANNELS"] = str(rcc)
+                if "recent_context_limit" in discord_cfg and not os.getenv("DISCORD_RECENT_CONTEXT_LIMIT"):
+                    os.environ["DISCORD_RECENT_CONTEXT_LIMIT"] = str(discord_cfg["recent_context_limit"])
+                if "recent_context_max_chars" in discord_cfg and not os.getenv("DISCORD_RECENT_CONTEXT_MAX_CHARS"):
+                    os.environ["DISCORD_RECENT_CONTEXT_MAX_CHARS"] = str(discord_cfg["recent_context_max_chars"])
+                if "recent_context_include_bots" in discord_cfg and not os.getenv("DISCORD_RECENT_CONTEXT_INCLUDE_BOTS"):
+                    os.environ["DISCORD_RECENT_CONTEXT_INCLUDE_BOTS"] = str(discord_cfg["recent_context_include_bots"]).lower()
                 if "buzzer_url" in discord_cfg and not os.getenv("BUZZER_URL"):
                     os.environ["BUZZER_URL"] = str(discord_cfg["buzzer_url"])
                 bsn = discord_cfg.get("buzzer_self_names")
@@ -972,6 +996,8 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["BUZZER_DEFAULT_PURPOSE"] = str(discord_cfg["buzzer_default_purpose"])
                 if "buzzer_queue_enabled" in discord_cfg and not os.getenv("BUZZER_QUEUE_ENABLED"):
                     os.environ["BUZZER_QUEUE_ENABLED"] = str(discord_cfg["buzzer_queue_enabled"]).lower()
+                if "buzzer_state_ttl_seconds" in discord_cfg and not os.getenv("BUZZER_STATE_TTL_SECONDS"):
+                    os.environ["BUZZER_STATE_TTL_SECONDS"] = str(discord_cfg["buzzer_state_ttl_seconds"])
                 # allow_mentions: granular control over what the bot can ping.
                 # Safe defaults (no @everyone/roles) are applied in the adapter;
                 # these YAML keys only override when set and let users opt back
