@@ -195,6 +195,27 @@ def test_buzzer_metadata_room_id_normalizes_discord_prefixes(metadata_value, exp
     )
 
 
+def test_buzzer_queue_disables_gateway_streaming_for_managed_channel():
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "buzzer_queue_enabled": True,
+                "buzzer_token": "test-token",
+                "buzzer_channels": ["1503787550"],
+            },
+        )
+    )
+    message = SimpleNamespace(
+        channel=SimpleNamespace(id=1503787550, parent_id=None),
+    )
+    event = SimpleNamespace(raw_message=message)
+
+    assert adapter.should_disable_gateway_streaming(event, chat_id="1503787550") is True
+    assert adapter.should_disable_gateway_streaming(chat_id="999") is False
+
+
 @pytest.mark.asyncio
 async def test_buzzer_queue_send_correlates_by_event_metadata_without_reply_to():
     adapter = DiscordAdapter(

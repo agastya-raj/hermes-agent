@@ -5242,6 +5242,23 @@ class DiscordAdapter(BasePlatformAdapter):
             self._flush_text_batch(key)
         )
 
+    def should_disable_gateway_streaming(
+        self,
+        event: MessageEvent | None = None,
+        *,
+        chat_id: str | None = None,
+    ) -> bool:
+        """Return True when streaming would bypass Buzzer queue arbitration."""
+        if not self._buzzer_queue_enabled():
+            return False
+        raw_message = getattr(event, "raw_message", None) if event is not None else None
+        if raw_message is not None:
+            return self._is_buzzer_enabled_for_message(raw_message)
+        if not self._buzzer_token():
+            return False
+        channels = self._buzzer_channels()
+        return "*" in channels or str(chat_id or "") in channels
+
     async def _flush_text_batch(self, key: str) -> None:
         """Wait for the quiet period then dispatch the aggregated text.
 
@@ -5252,9 +5269,10 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             pending = self._pending_text_batches.get(key)
             last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
+            raw_pending = getattr(pending, "raw_message", None) if pending else None
             if last_len >= self._SPLIT_THRESHOLD:
                 delay = self._text_batch_split_delay_seconds
-            elif pending and self._is_buzzer_enabled_for_message(pending.raw_message):
+            elif raw_pending is not None and self._is_buzzer_enabled_for_message(raw_pending):
                 delay = max(self._text_batch_delay_seconds, self._buzzer_burst_delay_seconds)
             else:
                 delay = self._text_batch_delay_seconds
@@ -5266,11 +5284,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 "[Discord] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
-            if not await self._claim_buzzer_turn(
-                event.raw_message,
-                getattr(event, "_buzzer_direct_addressed", False),
-            ):
-                return
+            raw_message = getattr(event, "raw_message", None)
+            if raw_message is not None:
+                if not await self._claim_buzzer_turn(
+                    raw_message,
+                    getattr(event, "_buzzer_direct_addressed", False),
+                ):
+                    return
             # Shield the downstream dispatch so that a subsequent chunk
             # arriving while handle_message is mid-flight cannot cancel
             # the running agent turn.  _enqueue_text_event always cancels

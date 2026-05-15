@@ -14173,6 +14173,11 @@ class GatewayRunner:
                 _adapter = self.adapters.get(source.platform)
                 if _adapter:
                     _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
+                    _disable_streaming = getattr(_adapter, "should_disable_gateway_streaming", None)
+                    if callable(_disable_streaming) and _disable_streaming(
+                        chat_id=source.chat_id,
+                    ):
+                        raise RuntimeError("skip streaming for adapter-managed final-send arbitration")
                     _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
                     _buffer_only = False
                     if source.platform == Platform.MATRIX:
@@ -14993,6 +14998,12 @@ class GatewayRunner:
                         _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
                         if not _adapter_supports_edit:
                             raise RuntimeError("skip streaming for non-editable platform")
+                        _disable_streaming = getattr(_adapter, "should_disable_gateway_streaming", None)
+                        if callable(_disable_streaming) and _disable_streaming(
+                            event,
+                            chat_id=source.chat_id,
+                        ):
+                            raise RuntimeError("skip streaming for adapter-managed final-send arbitration")
                         _effective_cursor = _scfg.cursor
                         # Some Matrix clients render the streaming cursor
                         # as a visible tofu/white-box artifact.  Keep
