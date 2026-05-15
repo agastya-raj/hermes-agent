@@ -160,6 +160,66 @@ async def test_send_does_not_retry_on_unrelated_errors():
     assert send_calls[0]["reference"] is reference_obj
 
 
+def test_buzzer_payload_uses_discord_room_snowflake():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(id=1503787550, parent_id=None)
+    guild = SimpleNamespace(id=999)
+    message = SimpleNamespace(id=1504627246, channel=channel, guild=guild)
+
+    payload = adapter._buzzer_payload(message)
+
+    assert payload["roomId"] == "1503787550"
+    assert payload["conversationId"] == "1503787550"
+    assert payload["messageId"] == "1504627246"
+    assert payload["legacyRoomId"] == "discord:999:1503787550"
+
+
+@pytest.mark.asyncio
+async def test_buzzer_queue_send_correlates_by_event_metadata_without_reply_to():
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"buzzer_queue_enabled": True},
+        )
+    )
+
+    captured_payloads = []
+
+    def fake_queue_submit(payload):
+        captured_payloads.append(payload)
+        return True, {"status": "deliver"}, None
+
+    adapter._post_buzzer_queue_sync = fake_queue_submit
+
+    channel = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(id=1234)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send(
+        "1503787550",
+        "hello from Luna",
+        metadata={
+            "notify": True,
+            "eventMessageId": "1504627246",
+            "conversationId": "1503787550",
+        },
+    )
+
+    assert result.success is True
+    assert result.message_id == "1234"
+    assert channel.send.await_count == 1
+    assert captured_payloads
+    assert captured_payloads[0]["messageId"] == "1504627246"
+    assert captured_payloads[0]["roomId"] == "1503787550"
+    assert captured_payloads[0]["conversationId"] == "1503787550"
+    assert captured_payloads[0]["candidateText"] == "hello from Luna"
+
+
 # ---------------------------------------------------------------------------
 # Forum channel tests
 # ---------------------------------------------------------------------------
