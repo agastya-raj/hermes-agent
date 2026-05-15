@@ -174,6 +174,27 @@ def test_buzzer_payload_uses_discord_room_snowflake():
     assert payload["legacyRoomId"] == "discord:999:1503787550"
 
 
+@pytest.mark.parametrize(
+    ("metadata_value", "expected"),
+    [
+        ("1503787550", "1503787550"),
+        ("channel:1503787550", "1503787550"),
+        ("discord:channel:1503787550", "1503787550"),
+        ("discord:999:1503787550", "1503787550"),
+        ("agent:main:discord:channel:1503787550", "1503787550"),
+        ("agent:main:discord:group:1503787550:1504000000", "1503787550"),
+    ],
+)
+def test_buzzer_metadata_room_id_normalizes_discord_prefixes(metadata_value, expected):
+    assert (
+        DiscordAdapter._buzzer_metadata_room_id(
+            "fallback",
+            {"conversationId": metadata_value},
+        )
+        == expected
+    )
+
+
 @pytest.mark.asyncio
 async def test_buzzer_queue_send_correlates_by_event_metadata_without_reply_to():
     adapter = DiscordAdapter(
@@ -206,7 +227,7 @@ async def test_buzzer_queue_send_correlates_by_event_metadata_without_reply_to()
         metadata={
             "notify": True,
             "eventMessageId": "1504627246",
-            "conversationId": "1503787550",
+            "conversationId": "discord:channel:1503787550",
         },
     )
 

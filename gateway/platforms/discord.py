@@ -1755,6 +1755,32 @@ class DiscordAdapter(BasePlatformAdapter):
         return ""
 
     @staticmethod
+    def _normalize_buzzer_room_id(value: Any) -> str:
+        room_id = str(value or "").strip()
+        if not room_id:
+            return ""
+
+        parts = room_id.split(":")
+        if (
+            len(parts) >= 5
+            and parts[0] == "agent"
+            and parts[1] == "main"
+            and parts[2] == "discord"
+        ):
+            return parts[4].strip()
+
+        if parts[0] == "discord":
+            if len(parts) >= 3 and parts[1] in {"channel", "thread", "group", "dm"}:
+                return parts[2].strip()
+            if len(parts) >= 2:
+                return parts[-1].strip()
+
+        if parts[0] in {"channel", "thread", "group", "dm"} and len(parts) >= 2:
+            return parts[1].strip()
+
+        return room_id
+
+    @staticmethod
     def _buzzer_metadata_room_id(chat_id: str, metadata: Optional[Dict[str, Any]]) -> str:
         if isinstance(metadata, dict):
             for key in (
@@ -1767,8 +1793,8 @@ class DiscordAdapter(BasePlatformAdapter):
             ):
                 value = metadata.get(key)
                 if value:
-                    return str(value)
-        return str(chat_id or "")
+                    return DiscordAdapter._normalize_buzzer_room_id(value)
+        return DiscordAdapter._normalize_buzzer_room_id(chat_id)
 
     async def _submit_buzzer_queue(
         self,
@@ -1799,7 +1825,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 msg_id,
                 room_id,
             )
-        room_id = str(base.get("roomId") or base.get("conversationId") or "")
+        room_id = self._normalize_buzzer_room_id(base.get("roomId") or base.get("conversationId") or "")
         payload = {
             "roomId": room_id,
             "conversationId": room_id,
