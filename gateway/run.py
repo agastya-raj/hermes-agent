@@ -7018,6 +7018,8 @@ class GatewayRunner:
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        _latency_t0 = time.perf_counter()
+        _latency_last = _latency_t0
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         logger.info(
@@ -7026,9 +7028,23 @@ class GatewayRunner:
             source.chat_id or "unknown", _msg_preview,
         )
 
+        def _latency_mark(stage: str) -> None:
+            nonlocal _latency_last
+            now = time.perf_counter()
+            logger.info(
+                "latency trace: session=%s platform=%s stage=%s step=%.3fs total=%.3fs",
+                _quick_key or "?",
+                _platform_name,
+                stage,
+                now - _latency_last,
+                now - _latency_t0,
+            )
+            _latency_last = now
+
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        _latency_mark("session_get_or_create")
         self._cache_session_source(session_key, source)
         if self._is_telegram_topic_lane(source):
             try:
@@ -7085,6 +7101,7 @@ class GatewayRunner:
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
+        _latency_mark("build_session_context")
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -7099,6 +7116,7 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        _latency_mark("build_context_prompt")
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -7202,6 +7220,7 @@ class GatewayRunner:
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
+        _latency_mark(f"load_transcript:{len(history)}")
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -7578,6 +7597,7 @@ class GatewayRunner:
         )
         if message_text is None:
             return
+        _latency_mark(f"prepare_inbound:{len(message_text)}")
 
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
@@ -7598,18 +7618,28 @@ class GatewayRunner:
                 "message": message_text[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)
+            _latency_mark("hook_agent_start")
 
             # Run the agent
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=session_entry.session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
+            try:
+                agent_result = await self._run_agent(
+                    message=message_text,
+                    context_prompt=context_prompt,
+                    history=history,
+                    source=source,
+                    session_id=session_entry.session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=self._reply_anchor_for_event(event),
+                    channel_prompt=event.channel_prompt,
+                )
+            except Exception:
+                _latency_mark("run_agent:error")
+                raise
+            _latency_mark(
+                "run_agent"
+                f":api_calls={agent_result.get('api_calls', 0)}"
+                f":model={agent_result.get('model') or 'unknown'}"
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -7737,6 +7767,7 @@ class GatewayRunner:
                 **hook_ctx,
                 "response": (response or "")[:500],
             })
+            _latency_mark("hook_agent_end")
             
             # Check for pending process watchers (check_interval on background processes)
             try:
@@ -7917,6 +7948,7 @@ class GatewayRunner:
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
+            _latency_mark("persist_transcript")
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))

@@ -12667,7 +12667,18 @@ class AIAgent:
                     # consumers are registered, and falls back to non-
                     # streaming automatically if the provider doesn't
                     # support it.
+                    _first_delta_logged = [False]
+
                     def _stop_spinner():
+                        if not _first_delta_logged[0]:
+                            _first_delta_logged[0] = True
+                            logger.info(
+                                "latency trace: provider_first_delta model=%s provider=%s api_mode=%s ttfb=%.3fs",
+                                api_kwargs.get("model", self.model),
+                                self.provider,
+                                self.api_mode,
+                                time.time() - api_start_time,
+                            )
                         nonlocal thinking_spinner
                         if thinking_spinner:
                             thinking_spinner.stop("")
@@ -12699,14 +12710,26 @@ class AIAgent:
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
 
-                    if _use_streaming:
-                        response = self._interruptible_streaming_api_call(
-                            api_kwargs, on_first_delta=_stop_spinner
+                    _api_call_succeeded = False
+                    try:
+                        if _use_streaming:
+                            response = self._interruptible_streaming_api_call(
+                                api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        else:
+                            response = self._interruptible_api_call(api_kwargs)
+                        _api_call_succeeded = True
+                    finally:
+                        api_duration = time.time() - api_start_time
+                        logger.info(
+                            "latency trace: provider_api_complete model=%s provider=%s api_mode=%s streaming=%s success=%s duration=%.3fs",
+                            api_kwargs.get("model", self.model),
+                            self.provider,
+                            self.api_mode,
+                            _use_streaming,
+                            _api_call_succeeded,
+                            api_duration,
                         )
-                    else:
-                        response = self._interruptible_api_call(api_kwargs)
-                    
-                    api_duration = time.time() - api_start_time
                     
                     # Stop thinking spinner silently -- the response box or tool
                     # execution messages that follow are more informative.

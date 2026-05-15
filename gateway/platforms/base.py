@@ -15,6 +15,7 @@ import re
 import socket as _socket
 import subprocess
 import sys
+import time
 import uuid
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
@@ -2489,6 +2490,13 @@ class BasePlatformAdapter(ABC):
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
+        # Some adapters intentionally veto delivery after a pre-send
+        # coordination check (for example Discord Buzzer revalidation). Treat
+        # that as a final suppressed send; falling back to plain text would
+        # bypass the coordination decision.
+        if error_str == "buzzer_revalidate_denied":
+            return result
+
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
         if not is_network and self._is_timeout_error(error_str):
@@ -3048,7 +3056,31 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
-            response = await self._message_handler(event)
+            _handler_t0 = time.perf_counter()
+            try:
+                response = await self._message_handler(event)
+            except asyncio.CancelledError:
+                logger.info(
+                    "latency trace: session=%s platform=%s stage=handler_total total=%.3fs success=False cancelled=True",
+                    session_key,
+                    self.name,
+                    time.perf_counter() - _handler_t0,
+                )
+                raise
+            except Exception:
+                logger.info(
+                    "latency trace: session=%s platform=%s stage=handler_total total=%.3fs success=False",
+                    session_key,
+                    self.name,
+                    time.perf_counter() - _handler_t0,
+                )
+                raise
+            logger.info(
+                "latency trace: session=%s platform=%s stage=handler_total total=%.3fs success=True",
+                session_key,
+                self.name,
+                time.perf_counter() - _handler_t0,
+            )
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
@@ -3147,6 +3179,7 @@ class BasePlatformAdapter(ABC):
                 # Send the text portion
                 if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
+                    _send_t0 = time.perf_counter()
                     _reply_anchor = _reply_anchor_for_event(event)
                     # Mark final response messages for notification delivery.
                     # Platform adapters that support per-message notification
@@ -3160,11 +3193,42 @@ class BasePlatformAdapter(ABC):
                         _thread_metadata["notify"] = True
                     else:
                         _thread_metadata = {"notify": True}
-                    result = await self._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_thread_metadata,
+                    source = getattr(event, "source", None)
+                    if getattr(event, "message_id", None) is not None:
+                        event_message_id = str(event.message_id)
+                        _thread_metadata["event_message_id"] = event_message_id
+                        _thread_metadata["eventMessageId"] = event_message_id
+                    if getattr(source, "chat_id", None) is not None:
+                        conversation_id = str(source.chat_id)
+                        _thread_metadata["conversation_id"] = conversation_id
+                        _thread_metadata["conversationId"] = conversation_id
+                        _thread_metadata["source_chat_id"] = conversation_id
+                        _thread_metadata["sourceChatId"] = conversation_id
+                    if getattr(source, "platform", None) is not None:
+                        _thread_metadata["platform"] = _platform_name(source.platform)
+                    _thread_metadata["session_key"] = session_key
+                    _thread_metadata["sessionKey"] = session_key
+                    try:
+                        result = await self._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_thread_metadata,
+                        )
+                    except Exception:
+                        logger.info(
+                            "latency trace: session=%s platform=%s stage=platform_send step=%.3fs success=False",
+                            session_key,
+                            self.name,
+                            time.perf_counter() - _send_t0,
+                        )
+                        raise
+                    logger.info(
+                        "latency trace: session=%s platform=%s stage=platform_send step=%.3fs success=%s",
+                        session_key,
+                        self.name,
+                        time.perf_counter() - _send_t0,
+                        getattr(result, "success", None),
                     )
                     _record_delivery(result)
 
